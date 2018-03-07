@@ -1,0 +1,256 @@
+#!/usr/bin/env python
+# encoding: utf-8
+
+import sys
+import re
+import argparse
+import subprocess
+
+# ANSI sequences for decorating matches
+STYLE_BOLD='\x1b[1m'
+STYLE_LIGHT='\x1b[2m'
+STYLE_UNDERLINE='\x1b[4m'
+STYLE_RESET='\x1b[0m'
+
+def calculate_line_indentation(line):
+    """Returns line indentation or None if line consists of spaces only
+    """
+    indentation = 0
+    line_len = len(line)
+    while indentation < line_len and line[indentation] == ' ':
+        indentation += 1
+    if indentation == line_len or line[indentation] == '\n':
+        return None
+    return indentation
+
+def decorate_matches(matches, prefix, suffix):
+    """Wraps each match from `matches` with `prefix` and `suffix`.
+    """
+    assert matches
+
+    source = matches[0].string
+    pos = 0
+    result = ''
+    for m in matches:
+        start, end = m.span()
+        result += source[pos:start]
+        result += prefix
+        result += source[start:end]
+        result += suffix
+        pos = end
+    result += source[pos:]
+    return result
+
+class Printer:
+    def __init__(self, out, opts):
+        self.out = out
+        self.opts = opts
+
+        if self.opts.colors == 'never':
+            self.colorize = False
+        elif self.opts.colors == 'always':
+            self.colorize = True
+        else:
+            assert self.opts.colors == 'auto'
+            self.colorize = self.out.isatty()
+
+        if self.colorize:
+            self.out.write(STYLE_RESET)
+
+    def print_match(self, lineno, line, matches):
+        if self.colorize:
+            line = decorate_matches(matches, STYLE_BOLD, STYLE_RESET)
+        self.out.write('{:4}: {}'.format(lineno, line))
+
+    def print_context(self, lineno, line):
+        if self.colorize:
+            decorated = "{}{:4}: {}{}".format(STYLE_LIGHT, lineno, line, STYLE_RESET)
+        else:
+            decorated = "{:4}: {}".format(lineno, line)
+        self.out.write(decorated)
+
+    def print_filename(self, filename):
+        if self.colorize:
+            filename = "{}{}{}".format(STYLE_UNDERLINE, filename, STYLE_RESET)
+        self.out.write("\n{}\n\n".format(filename))
+
+    def print_ellipsis(self):
+        if self.opts.print_ellipsis:
+            self.out.write('   …\n')
+
+    def print_break(self):
+        if self.opts.print_breaks:
+            self.out.write('\n')
+
+def process_file(filename, input_file, regex, printer, opts):
+    # Context lines to be printed if some line matches.
+    # Already printed lines are removed from context.
+    context = []
+
+    # Whether at least one match found
+    match_found = False
+    
+    # Number of last printed line, whether it is a context or a match
+    last_printed_lineno = None
+
+    was_empty_line = False
+
+    for (lineno, line) in enumerate(input_file, 1):
+        indentation = calculate_line_indentation(line)
+        if indentation is None:
+            # Empty line
+            was_empty_line = True
+            continue
+
+        # Ignore lines looking like C preprocessor instruction, because they
+        # are often written without indentation and this breaks context.
+        if opts.ignore_preprocessor and \
+           any(line[indentation:].startswith(prefix) for prefix in ['#if ', '#else ', '#endif']):
+            continue
+
+        # Drop all lines with indentation higher or equal to current one
+        # But optionally check for if/if-else/else branches and preserve them.
+        def obsolete_context(ctx_entry):
+            c_ind, c_lineno, c_line = ctx_entry
+            if c_ind > indentation:
+                return True
+            
+            if c_ind < indentation:
+                return False
+
+            assert c_ind == indentation
+            if not opts.smart_branches:
+                return True
+            
+            if line[indentation:].startswith('} else ') and \
+               (c_line[c_ind:].startswith('if ') or c_line[c_ind:].startswith('} else if')):
+                return False
+            
+            return True
+
+        height = len(context)
+        while height > 0 and obsolete_context(context[height-1]):
+            height -= 1
+        del context[height:]
+
+        context.append((indentation, lineno, line))
+
+        matches = list(regex.finditer(line))
+        if matches:
+            # Print filename, if needed, when first match found
+            if not match_found and opts.print_filename and filename != '-':
+                printer.print_filename(filename)
+
+            if was_empty_line and match_found:
+                printer.print_break()
+            was_empty_line = False
+
+            match_found = True
+
+            for (indentation, lineno, line) in context[:-1]:
+                if last_printed_lineno is not None and lineno > last_printed_lineno + 1:
+                    printer.print_ellipsis()
+
+                printer.print_context(lineno, line)
+                last_printed_lineno = lineno
+            (indentation, lineno, line) = context[-1]
+
+            if last_printed_lineno is not None and lineno > last_printed_lineno + 1:
+                printer.print_ellipsis()
+            printer.print_match(lineno, line, matches)
+            last_printed_lineno = lineno
+
+            context = []
+
+    return match_found
+
+def parse_arguments(args):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('pattern', help="Text or regular expression to search for")
+    parser.add_argument('file', nargs='?', default='-',
+                        metavar="FILE", help="File to search in")
+    parser.add_argument('-e', '--regex', dest='use_regex', action='store_true',
+                        help="Treat pattern as regular expression")
+    parser.add_argument('-w', '--word', dest='word', action='store_true',
+                        help="Match whole words only")
+    parser.add_argument('-i', dest='case_insensitive', action='store_true',
+                        help="Match case-insensitive")
+    parser.add_argument('--colors', dest='colors', choices=['always', 'auto', 'never'],
+                        default='auto', help="When to use colors to highlight matches")
+    parser.add_argument('--ellipsis', dest='print_ellipsis', action='store_true',
+                        help="Print ellipsis when lines were skipped")
+    parser.add_argument('--no-breaks', dest='print_breaks', action='store_false',
+                        help="Don''t preserve blank lines between matched regions")
+    parser.add_argument('-f', '--print-filename', dest='print_filename', action='store_true',
+                        help="Print filename if any match found")
+    parser.add_argument('-b', '--no-smart-branches', dest='smart_branches', action='store_false',
+                        help="Specially handle if/if-else/else conditionals")
+    parser.add_argument('--no-ignore-preprocessor', dest='ignore_preprocessor', action='store_false',
+                        help="Ignore C preprocessor instructions")
+    parser.add_argument('-g', '--git-grep', dest='use_git_grep', action='store_true',
+                        help="Use 'git grep' to filter files, FILE is used as path specification")
+    return parser.parse_args(args)
+
+def main(args):
+    opts = parse_arguments(args)
+
+    flags = 0
+    if opts.case_insensitive:
+        flags |= re.I
+    try:
+        pattern = opts.pattern
+        if not opts.use_regex:
+            pattern = re.escape(pattern)
+        if opts.word:
+            pattern = r'\b{}\b'.format(pattern)
+        regex = re.compile(pattern, flags)
+
+    except re.error as e:
+        sys.stderr.write("Regex compilation error: {}".format(e.message))
+        return 2
+
+    printer = Printer(sys.stdout, opts)
+
+    if opts.use_git_grep:
+        git_grep_opts = ['--files-with-matches']
+        if opts.case_insensitive:
+            git_grep_opts.append('--ignore-case')
+        if not opts.use_regex:
+            git_grep_opts.append('--fixed-strings')
+        if opts.word:
+            git_grep_opts.append('--word-regexp')
+        try:
+            output = subprocess.check_output(
+                ['git', 'grep'] + git_grep_opts + ['-e', opts.pattern, '--', opts.file])
+            output = output.decode('utf-8')
+        except subprocess.CalledProcessError:
+            sys.stderr.write('git grep failed\n')
+            return 2
+
+        # Force printing file names
+        opts.print_filename = True
+
+        match_found = False
+        for path in output.splitlines():
+            with open(path, 'r') as input_file:
+                file_match_found = process_file(path, input_file, regex, printer, opts)
+                if file_match_found:
+                    match_found = True
+
+    else:
+        if opts.file != '-':
+            input_file = open(opts.file, 'r')
+        else:
+            input_file = sys.stdin
+
+        try:
+            match_found = process_file(opts.file, input_file, regex, printer, opts)
+        finally:
+            if opts.file != '-':
+                input_file.close()
+
+    return 0 if match_found else 1
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
