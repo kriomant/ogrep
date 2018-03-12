@@ -223,7 +223,10 @@ def main(args):
             output = subprocess.check_output(
                 ['git', 'grep'] + git_grep_opts + ['-e', opts.pattern, '--', opts.file])
             output = output.decode('utf-8')
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 1:
+                # No lines selected
+                return 1
             sys.stderr.write('git grep failed\n')
             return 2
 
